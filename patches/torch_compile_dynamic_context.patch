@@ -1,0 +1,122 @@
+diff --git a/comfy_api/torch_helpers/torch_compile.py b/comfy_api/torch_helpers/torch_compile.py
+index 408a14a..53bff1c 100644
+--- a/comfy_api/torch_helpers/torch_compile.py
++++ b/comfy_api/torch_helpers/torch_compile.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
++import inspect
+ import torch
+ 
+ import comfy.utils
+ from comfy.patcher_extension import WrappersMP
+@@ -12,8 +13,41 @@ if TYPE_CHECKING:
+ COMPILE_KEY = "torch.compile"
+ TORCH_COMPILE_KWARGS = "torch_compile_kwargs"
+ 
+ 
++class _SelectiveDynamicModule(torch.nn.Module):
++    """Mark only requested input axes dynamic before entering Inductor."""
++
++    def __init__(self, module: torch.nn.Module, compile_kwargs: dict,
++                 dynamic_input_dims: dict[str, tuple[int, int | None, int | None]]):
++        super().__init__()
++        self.compiled_module = torch.compile(model=module, **compile_kwargs)
++        parameters = list(inspect.signature(module.forward).parameters)
++        self.dynamic_inputs = []
++        for name, (dim, minimum, maximum) in dynamic_input_dims.items():
++            position = parameters.index(name) if name in parameters else None
++            self.dynamic_inputs.append((name, position, dim, minimum, maximum))
++
++    def __getattr__(self, name):
++        """Preserve the wrapped diffusion model's public attributes for ComfyUI."""
++        try:
++            return super().__getattr__(name)
++        except AttributeError:
++            compiled_module = super().__getattr__("compiled_module")
++            return getattr(compiled_module, name)
++
++    def forward(self, *args, **kwargs):
++        for name, position, dim, minimum, maximum in self.dynamic_inputs:
++            value = kwargs.get(name)
++            if value is None and position is not None and position < len(args):
++                value = args[position]
++            if torch.is_tensor(value):
++                torch._dynamo.mark_dynamic(
++                    value, dim, min=minimum, max=maximum
++                )
++        return self.compiled_module(*args, **kwargs)
++
++
+ def apply_torch_compile_factory(compiled_module_dict: dict[str, Callable]) -> Callable:
+     '''
+     Create a wrapper that will refer to the compiled_diffusion_model.
+     '''
+@@ -31,9 +65,11 @@ def apply_torch_compile_factory(compiled_module_dict: dict[str, Callable]) -> Ca
+ 
+ 
+ def set_torch_compile_wrapper(model: ModelPatcher, backend: str, options: Optional[dict[str,str]]=None,
+                               mode: Optional[str]=None, fullgraph=False, dynamic: Optional[bool]=None,
+-                              keys: list[str]=["diffusion_model"], *args, **kwargs):
++                              keys: list[str]=["diffusion_model"],
++                              dynamic_input_dims: Optional[dict[str, tuple[int, int | None, int | None]]]=None,
++                              *args, **kwargs):
+     '''
+     Perform torch.compile that will be applied at sample time for either the whole model or specific params of the BaseModel instance.
+ 
+     When keys is None, it will default to using ["diffusion_model"], compiling the whole diffusion_model.
+@@ -54,17 +90,22 @@ def set_torch_compile_wrapper(model: ModelPatcher, backend: str, options: Option
+     }
+     # get a dict of compiled keys
+     compiled_modules = {}
+     for key in keys:
+-        compiled_modules[key] = torch.compile(
+-                model=model.get_model_object(key),
+-                **compile_kwargs,
++        module = model.get_model_object(key)
++        if dynamic_input_dims:
++            compiled_modules[key] = _SelectiveDynamicModule(
++                module, compile_kwargs, dynamic_input_dims
+             )
++        else:
++            compiled_modules[key] = torch.compile(
++                    model=module,
++                    **compile_kwargs,
++                )
+     # add torch.compile wrapper
+     wrapper_func = apply_torch_compile_factory(
+         compiled_module_dict=compiled_modules,
+     )
+     # store wrapper to run on BaseModel's apply_model function
+     model.add_wrapper_with_key(WrappersMP.APPLY_MODEL, COMPILE_KEY, wrapper_func)
+     # keep compile kwargs for reference
+     model.model_options[TORCH_COMPILE_KWARGS] = compile_kwargs
+-
+diff --git a/comfy_extras/nodes_torch_compile.py b/comfy_extras/nodes_torch_compile.py
+index c760b73..ce3eb33 100644
+--- a/comfy_extras/nodes_torch_compile.py
++++ b/comfy_extras/nodes_torch_compile.py
+@@ -25,9 +25,17 @@ class TorchCompileModel(io.ComfyNode):
+ 
+     @classmethod
+     def execute(cls, model, backend) -> io.NodeOutput:
+         m = model.clone(disable_dynamic=True)
+-        set_torch_compile_wrapper(model=m, backend=backend, options={"guard_filter_fn": skip_torch_compile_dict})
++        # Keep image/model dimensions specialized, but allow FLUX text context
++        # length to vary without compiling a new graph for every prompt length.
++        context_dynamic = {"context": (1, 1, 1024)} if backend == "inductor" else None
++        set_torch_compile_wrapper(
++            model=m,
++            backend=backend,
++            options={"guard_filter_fn": skip_torch_compile_dict},
++            dynamic_input_dims=context_dynamic,
++        )
+         return io.NodeOutput(m)
+ 
+ 
+ class TorchCompileExtension(ComfyExtension):
+@@ -39,5 +47,4 @@ class TorchCompileExtension(ComfyExtension):
+ 
+ 
+ async def comfy_entrypoint() -> TorchCompileExtension:
+     return TorchCompileExtension()
+-

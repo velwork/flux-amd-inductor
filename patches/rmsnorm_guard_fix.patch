@@ -1,0 +1,20 @@
+diff --git a/comfy/ops.py b/comfy/ops.py
+index ff64aad..bf0e0f4 100644
+--- a/comfy/ops.py
++++ b/comfy/ops.py
+@@ -844,8 +844,15 @@ class manual_cast(disable_weight_init):
+ 
+     class RMSNorm(disable_weight_init.RMSNorm):
+         comfy_cast_weights = True
+ 
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            # ModelPatcher assigns this during partial unload/reload.  Keep it
++            # in the instance dict from construction so Dynamo's layout guard
++            # does not change between otherwise identical inference runs.
++            self.comfy_cast_weights = True
++
+     class Embedding(disable_weight_init.Embedding):
+         comfy_cast_weights = True
+ 
+ 

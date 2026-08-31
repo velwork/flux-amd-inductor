@@ -1,0 +1,67 @@
+diff --git a/custom_nodes/ComfyUI-GGUF/ops.py b/custom_nodes/ComfyUI-GGUF/ops.py
+index 13c7ab5..6f5c1bc 100644
+--- a/custom_nodes/ComfyUI-GGUF/ops.py
++++ b/custom_nodes/ComfyUI-GGUF/ops.py
+@@ -230,8 +230,10 @@ class GGMLOps(comfy.ops.manual_cast):
+     """
+     class Linear(GGMLLayer, comfy.ops.manual_cast.Linear):
+         def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+             torch.nn.Module.__init__(self)
++            # Keep Dynamo's attribute-layout guard stable across partial unload/reload.
++            self.comfy_cast_weights = True
+             # TODO: better workaround for reserved memory spike on windows
+             # Issue is with `torch.empty` still reserving the full memory for the layer
+             # Windows doesn't over-commit memory so without this 24GB+ of pagefile is used
+             self.in_features = in_features
+@@ -243,13 +245,21 @@ class GGMLOps(comfy.ops.manual_cast):
+             weight, bias = self.cast_bias_weight(input)
+             return torch.nn.functional.linear(input, weight, bias)
+ 
+     class Conv2d(GGMLLayer, comfy.ops.manual_cast.Conv2d):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.comfy_cast_weights = True
++
+         def forward_ggml_cast_weights(self, input):
+             weight, bias = self.cast_bias_weight(input)
+             return self._conv_forward(input, weight, bias)
+ 
+     class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.comfy_cast_weights = True
++
+         def forward_ggml_cast_weights(self, input, out_dtype=None):
+             output_dtype = out_dtype
+             if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
+                 out_dtype = None
+@@ -258,15 +268,23 @@ class GGMLOps(comfy.ops.manual_cast):
+                 input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse
+             ).to(dtype=output_dtype)
+ 
+     class LayerNorm(GGMLLayer, comfy.ops.manual_cast.LayerNorm):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.comfy_cast_weights = True
++
+         def forward_ggml_cast_weights(self, input):
+             if self.weight is None:
+                 return super().forward_comfy_cast_weights(input)
+             weight, bias = self.cast_bias_weight(input)
+             return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
+ 
+     class GroupNorm(GGMLLayer, comfy.ops.manual_cast.GroupNorm):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.comfy_cast_weights = True
++
+         def forward_ggml_cast_weights(self, input):
+             weight, bias = self.cast_bias_weight(input)
+             return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
+ 
+@@ -278,5 +296,4 @@ def move_patch_to_device(item, device):
+     elif isinstance(item, list):
+         return [move_patch_to_device(x, device) for x in item]
+     else:
+         return item
+-
